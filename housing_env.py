@@ -92,7 +92,8 @@ class HousingEnv(gym.Env):
         inspection_rate: int = 4,
         years: int = 4,
         data_path: Optional[str] = "data/311_preproc.csv",
-        max_active_reports: int = 2000,
+           max_active_reports: int = 300,
+           hierarchical: bool = True,
     ):
         super().__init__()
 
@@ -105,6 +106,7 @@ class HousingEnv(gym.Env):
         self.time_steps = int(self.years * 365)
         self.data_path = data_path
         self.max_active_reports = max_active_reports
+        self.hierarchical = hierarchical
 
         # internal state
         self.current_step = 0
@@ -233,18 +235,27 @@ class HousingEnv(gym.Env):
         })
 
         # Action space: indices into the active pool slots (1-based), 0 = skip
-        self.action_space = spaces.MultiDiscrete(
-            [self.max_active_reports + 1] * (self.num_inspectors * self.inspection_rate)
-        )
+        # Hierarchical action space: (inspector_id, report_id) -> Discrete(num_inspectors * max_active_reports)
+        if self.hierarchical:
+            self.action_space = spaces.Discrete(self.num_inspectors * self.max_active_reports)
+        else:
+            # Original flat action space (not recommended; mainly for backwards compatibility)
+            self.action_space = spaces.MultiDiscrete(
+                [self.max_active_reports + 1] * (self.num_inspectors * self.inspection_rate)
+            )
 
     # ------------------------------------------------------------------
     # environment life‑cycle methods
     # ------------------------------------------------------------------
 
-    def reset(self) -> np.ndarray:
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> np.ndarray:
         """Start a new episode by sampling ``num_reports`` observations from the
         dataset and resetting all bookkeeping state.
         """
+        # handle seeding for reproducibility
+        if seed is not None:
+            np.random.seed(seed)
+
         # initialise chronological pointers and state
         self.current_step = 0
         self.episode_violations_fixed = 0
@@ -265,7 +276,9 @@ class HousingEnv(gym.Env):
         # admit cases for the first date so the initial observation includes them
         self._admit_reports_for_date(self.current_date)
 
-        return self._get_observation()
+        obs = self._get_observation()
+        info = {"current_date": str(self.current_date)}
+        return obs, info
 
     def step(self, action: np.ndarray):
         """Apply the inspectors' choices for this day and return the new state,
@@ -275,53 +288,102 @@ class HousingEnv(gym.Env):
         inspection_details = []  # record per-report features/outcomes
         reward = 0.0
 
-        for insp_id in range(self.num_inspectors):
-            for slot in range(self.inspection_rate):
-                pos = insp_id * self.inspection_rate + slot
-                choice = int(action[pos])
-                # 0 = skip, otherwise 1-based index into active slots
-                if choice == 0:
-                    continue
-                if choice > len(self.violations):
-                    # chosen an inactive/padded slot
-                    continue
-
-                vidx = choice - 1
-                if vidx < 0 or vidx >= len(self.violations):
-                    continue
-
-                violations_inspected.add(vidx)
+        if self.hierarchical:
+            # Hierarchical action: single Discrete value
+            # Decode: inspector_id = action // max_active_reports, report_id = action % max_active_reports
+            action_val = int(action)
+            insp_id = action_val // self.max_active_reports
+            report_id = action_val % self.max_active_reports
+            
+            # Validate inspector and report indices
+            if insp_id < 0 or insp_id >= self.num_inspectors:
+                insp_id = 0
+            if report_id >= len(self.violations):
+                report_id = len(self.violations) - 1 if len(self.violations) > 0 else -1
+            
+            # Perform inspection if valid
+            if report_id >= 0 and report_id < len(self.violations):
+                vidx = report_id
                 violation = self.violations[vidx]
-                if violation.resolved:
-                    continue
-                # record pre-inspection state
-                inspection_details.append({
-                    'report_idx': vidx,
-                    'days_outstanding_before': violation.days_outstanding,
-                    'address': violation.address,
-                    'borough': violation.borough,
-                })
+                if not violation.resolved:
+                    violations_inspected.add(vidx)
+                    # record pre-inspection state
+                    inspection_details.append({
+                        'report_idx': vidx,
+                        'days_outstanding_before': violation.days_outstanding,
+                        'address': violation.address,
+                        'borough': violation.borough,
+                    })
 
-                # sample outcome
-                roll = np.random.random()
-                cum = 0.0
-                for res, prob in self.outcome_probs.items():
-                    cum += prob
-                    if roll < cum:
-                        violation.outcome = res
-                        break
-                violation.resolved = violation.outcome != Resolution.OPEN
-                # append outcome to the inspection record
-                inspection_details[-1]['outcome'] = violation.outcome.name
+                    # sample outcome
+                    roll = np.random.random()
+                    cum = 0.0
+                    for res, prob in self.outcome_probs.items():
+                        cum += prob
+                        if roll < cum:
+                            violation.outcome = res
+                            break
+                    violation.resolved = violation.outcome != Resolution.OPEN
+                    # append outcome to the inspection record
+                    inspection_details[-1]['outcome'] = violation.outcome.name
 
-                # accumulate reward for this individual inspection
-                if violation.outcome == Resolution.VIOLATION:
-                    reward += 20.0
-                    self.episode_violations_fixed += 1
-                elif violation.outcome == Resolution.DUPLICATE:
-                    reward += 3.0
-                elif violation.outcome in (Resolution.NO_ACCESS, Resolution.CORRECTED, Resolution.NO_VIOLATION):
-                    reward += 1.0
+                    # accumulate reward for this individual inspection
+                    if violation.outcome == Resolution.VIOLATION:
+                        reward += 20.0
+                        self.episode_violations_fixed += 1
+                    elif violation.outcome == Resolution.DUPLICATE:
+                        reward += 3.0
+                    elif violation.outcome in (Resolution.NO_ACCESS, Resolution.CORRECTED, Resolution.NO_VIOLATION):
+                        reward += 1.0
+        else:
+            # Original flat action space (multiple actions per step)
+            for insp_id in range(self.num_inspectors):
+                for slot in range(self.inspection_rate):
+                    pos = insp_id * self.inspection_rate + slot
+                    choice = int(action[pos])
+                    # 0 = skip, otherwise 1-based index into active slots
+                    if choice == 0:
+                        continue
+                    if choice > len(self.violations):
+                        # chosen an inactive/padded slot
+                        continue
+
+                    vidx = choice - 1
+                    if vidx < 0 or vidx >= len(self.violations):
+                        continue
+
+                    violations_inspected.add(vidx)
+                    violation = self.violations[vidx]
+                    if violation.resolved:
+                        continue
+                    # record pre-inspection state
+                    inspection_details.append({
+                        'report_idx': vidx,
+                        'days_outstanding_before': violation.days_outstanding,
+                        'address': violation.address,
+                        'borough': violation.borough,
+                    })
+
+                    # sample outcome
+                    roll = np.random.random()
+                    cum = 0.0
+                    for res, prob in self.outcome_probs.items():
+                        cum += prob
+                        if roll < cum:
+                            violation.outcome = res
+                            break
+                    violation.resolved = violation.outcome != Resolution.OPEN
+                    # append outcome to the inspection record
+                    inspection_details[-1]['outcome'] = violation.outcome.name
+
+                    # accumulate reward for this individual inspection
+                    if violation.outcome == Resolution.VIOLATION:
+                        reward += 20.0
+                        self.episode_violations_fixed += 1
+                    elif violation.outcome == Resolution.DUPLICATE:
+                        reward += 3.0
+                    elif violation.outcome in (Resolution.NO_ACCESS, Resolution.CORRECTED, Resolution.NO_VIOLATION):
+                        reward += 1.0
 
         # step penalty for open reports (encourage throughput)
         open_count = sum(1 for v in self.violations if not v.resolved)
@@ -338,7 +400,8 @@ class HousingEnv(gym.Env):
 
         self.current_step += 1
 
-        done = (self.current_step >= self.time_steps) or (self.current_date > self.end_date)
+        terminated = (self.current_step >= self.time_steps) or (self.current_date > self.end_date)
+        truncated = False  # No truncation in this environment
 
         obs = self._get_observation()
         info = {
@@ -348,7 +411,7 @@ class HousingEnv(gym.Env):
             "current_date": str(self.current_date),
             "inspection_details": inspection_details,
         }
-        return obs, reward, done, info
+        return obs, reward, terminated, truncated, info
 
     def _make_violation(self, idx: int, row: pd.Series) -> ViolationReport:
         return ViolationReport(
