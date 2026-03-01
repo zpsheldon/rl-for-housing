@@ -1,555 +1,461 @@
 """
-Custom OpenAI Gym Environment for Housing Code Violation Inspection Optimization
+Revised OpenAI Gym Environment for Housing Code Violation Inspection Optimization
 
-This environment models the problem of allocating housing inspectors to code violation
-reports from NYC's 311 service to maximize the number of violations fixed.
+This version is tailored to the preprocessed 311 data in
+`data/311_preproc.csv`.  It reflects the problem formulation described by the
+user:
+
+- five resolution categories (no access, duplicate, corrected, no violation,
+  violation) that account for the vast majority of heat/hot water complaints,
+  and all other reports have been discarded during preprocessing.
+- inspectors make up to four inspections per day and select which reports to
+  visit; the environment stochastically determines the outcome using
+  empirically-derived probabilities.
+- positive rewards are given for closing reports, with the largest incentive
+  allocated to issuing violations; duplicates are worth a small bonus because
+  they require no travel; cases that consume travel resources but close
+  without a violation earn a modest reward.  There is a per‑timestep penalty for
+  each open report to encourage overall throughput.
+
+Geographic and problem attributes from the preprocessed dataset are encoded as
+numeric features in the state vector so that learning agents may condition on
+them.  The environment does _not_ currently enforce borough‑specific inspector
+constraints, but those could be layered on later.
+
+To initialise the environment give the path to your preprocessed CSV file;
+otherwise the environment will raise an error when reset() is called.
 """
 
-import gym
-from gym import spaces
+import datetime
+import gymnasium as gym
+from gymnasium import spaces
 import numpy as np
-from typing import Dict, Tuple, List, Optional
+import pandas as pd
+from typing import List, Optional, Dict
 from dataclasses import dataclass
 from enum import Enum
 
 
-class InspectionAction(Enum):
-    """Enumeration of possible inspection case outcomes."""
-    NO_ACTION = 0
-    ISSUE_WARNING = 1
-    CLOSE_DUPLICATE = 2
-    CLOSE_RESOLVED = 3
+class Resolution(Enum):
+    OPEN = 0
+    NO_ACCESS = 1
+    DUPLICATE = 2
+    CORRECTED = 3
+    NO_VIOLATION = 4
+    VIOLATION = 5
 
 
 @dataclass
 class ViolationReport:
-    """Represents a 311 housing code violation report."""
+    """Represents a single 311 housing report extracted from the preprocessed
+    file.  All of the attributes correspond directly to columns in
+    ``311_preproc.csv``.
+    """
     report_id: int
-    no_heat: bool # Whether report is for no heat
-    no_hot_water: bool # Whether report is for no hot water
-    address: str  # Address
-    street_name: str # street name
-    borough: str # Borough
-    council_district: int # Council District
-    building_wide: bool # Whether report is building-wide
-    date_reported: str  # Date of report
-    days_outstanding: int  # Days since report was filed
-    priority_score: float  # Calculated priority (0-1)
-    resolved_date: str # date that report was resolved
-    resolved: bool = False  # Whether report has been resolved -- either duplicate or fixed
-    duplicate: bool = False # Whether report is a duplicate for a building-wide issue
-    status: str = "OPEN"  # Status: OPEN, WARNING_ISSUED, DUPLICATE, RESOLVED
-    inspection_count: int = 0  # Number of times this report has been inspected
+    address: str
+    street_name: str
+    borough: str
+    council_district: float
+    apartment_only: int
+    building_wide: int
+    no_heat: int
+    no_hot_water: int
+    created_date: pd.Timestamp
+    days_outstanding: float
 
-@dataclass
-class Inspector:
-    """Represents an available inspector."""
-    inspector_id: int
-    available: bool = True
-    violations_fixed_count: int = 0
+    # labels present in the dataset (not used for transition dynamics but handy
+    # for evaluation/analysis).
+    no_access: int
+    duplicate: int
+    corrected: int
+    no_violation_issued: int
+    violation_issued: int
 
-class HousingViolationEnv(gym.Env):
+    # state maintained by the environment during an episode
+    resolved: bool = False
+    outcome: Resolution = Resolution.OPEN
+
+
+class HousingEnv(gym.Env):
+    """Gym environment modelling the inspector allocation problem described
+    by the user.  It makes no attempt to enforce geographic constraints or a
+    variable workforce; each episode simply samples ``num_reports`` from the
+    preprocessed dataset and keeps them fixed for the duration of the episode.
     """
-    Custom Gym environment for optimizing housing code violation inspections.
-    
-    State Space:
-    - Active violation reports with their attributes
-    - Inspector availability
-    - Historical inspection outcomes
-    
-    Action Space:
-    - Allocate each available inspector to a specific violation report
-    - Pass (do not allocate to a report)
-    
-    Reward:
-    - Positive reward for violations marked as resolved
-    - Positive reward for violations inspected and marked as duplicate
-    - Positive reward for violations inspected and warning issued
-    - Penalty for violations remaining uninspected
-    - Penalty for violations remaining open despite warning
-    """
-    
+
+    metadata = {"render.modes": ["human"]}
+
     def __init__(
         self,
         num_inspectors: int = 100,
-        num_reports: int = 50,
+        num_reports: int = 1000,
         inspection_rate: int = 4,
-        time_steps: int = 365,
-        violation_data_path: Optional[str] = None,
+        years: int = 4,
+        data_path: Optional[str] = "data/311_preproc.csv",
+        max_active_reports: int = 2000,
     ):
-        """
-        Initialize the Housing Violation Inspection environment.
-        
-        Args:
-            num_inspectors: Number of available inspectors
-            num_reports: Number of reports read in per timestep
-            inspection_rate: Number of inspections an individual inspector can do per day
-            time_steps: Number of timesteps in an episode (day)
-            violation_data_path: Path to 311 CSV data file
-        """
-        super(HousingViolationEnv, self).__init__()
-        
-        # ====================
-        # Configuration
-        # ====================
+        super().__init__()
+
+        # configuration parameters
         self.num_inspectors = num_inspectors
         self.num_reports = num_reports
-        self.time_steps = time_steps
         self.inspection_rate = inspection_rate
-        self.violation_data_path = violation_data_path
-        
-        # Inspection outcome probabilities
-        self.inspection_outcome_probs = {
-            'issue_warning': 0.5,
-            'close_duplicate': 0.1,
-            'close_resolved': 0.1
-        }
-        
-        # ====================
-        # STATE SPACE CONFIGURATION
-        # ====================
-        # Each violation report is represented by:
-        # - days_outstanding (continuous, 0-365)
-        # - priority_score (continuous, 0-1)
-        # - address (discrete)
-        # - street_name (discrete)
-        # - borough (discrete, 0-4)
-        # - council_district (discrete, 0-50)
-        # - building_wide (discrete, 0-1)
-        # - date_reported (discrete)
-        # - resolved_date (discrete)
-        # - resolved (discrete, 0-1)
-        # - duplicate (discrete, 0-1)
+        # episodes will span `years` years (approx); convert to days
+        self.years = years
+        self.time_steps = int(self.years * 365)
+        self.data_path = data_path
+        self.max_active_reports = max_active_reports
 
-        # Total: 11 features per report
-        num_reports = 50
-        violation_features_per_report = 11
-        
-        # Inspector state features:
-        # - available (binary, 0 or 1) -> num_inspectors
-        # Total: 1 feature per inspector
-        
-        inspector_features = num_inspectors * 1
-        
-        # Total state size
-        total_state_size = num_reports*violation_features_per_report + inspector_features + 1  # +1 for timestep
-        
-        self.observation_space = spaces.Box(
+        # internal state
+        self.current_step = 0
+        self.episode_violations_fixed = 0
+        self.violations: List[ViolationReport] = []
+        self.inspectors_available: List[bool] = []
+
+        # load and prepare the dataset immediately so we can compute encodings
+        self._load_and_prepare_data()
+
+        # build encoders for categorical attributes that will appear in the
+        # observation vector
+        self._build_encoders()
+
+        # outcome probabilities (sum to 1)
+        self.outcome_probs: Dict[Resolution, float] = {
+            Resolution.NO_ACCESS: 0.14,
+            Resolution.DUPLICATE: 0.33,
+            Resolution.CORRECTED: 0.33,
+            Resolution.VIOLATION: 0.10,
+            Resolution.NO_VIOLATION: 0.10,
+        }
+
+        # construct observation & action spaces based on the configuration
+        self._configure_spaces()
+
+    # ------------------------------------------------------------------
+    # data loading / preprocessing
+    # ------------------------------------------------------------------
+
+    def _load_and_prepare_data(self):
+        """Read CSV and filter to rows that contain one of the five core
+        resolution types.  Compute ``days_outstanding`` from the provided
+        duration column (already present during preprocessing) so that policies
+        can condition on it directly.
+        """
+        if self.data_path is None:
+            raise ValueError("data_path must be provided to load real data")
+
+        df = pd.read_csv(self.data_path)
+        # ensure necessary columns are present
+        required_cols = [
+            "Incident Address",
+            "Street Name",
+            "Borough",
+            "Council District",
+            "Apartment_Only",
+            "Entire_Building",
+            "No_Heat",
+            "No_Hot_Water",
+            "Created Date",
+            "Duration_Days",
+            "No_Access",
+            "Duplicate",
+            "Corrected",
+            "No_Violation_Issued",
+            "Violation_Issued",
+        ]
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise KeyError(f"Dataset missing expected column(s): {missing}")
+
+        # filter out cases with none of the five core resolutions
+        df = df[                                           # keep at least one flag
+            df["No_Access"]
+            + df["Duplicate"]
+            + df["Corrected"]
+            + df["No_Violation_Issued"]
+            + df["Violation_Issued"]
+            > 0
+        ].copy()
+
+        # parse dates and normalise the Created Date to date-only (floor to day)
+        df["Created Date"] = pd.to_datetime(df["Created Date"], errors="coerce")
+        df = df.dropna(subset=["Created Date"])  # drop rows we can't date
+        df["Created Date"] = df["Created Date"].dt.floor("D")
+
+        # days outstanding already exists as Duration_Days; use it and clip to
+        # a reasonable bound for normalization later
+        df["days_outstanding"] = df["Duration_Days"].fillna(0).astype(float)
+
+        # sort chronologically to enable sequential admission
+        self._df_master = df.sort_values("Created Date").reset_index(drop=True)
+
+    def _build_encoders(self):
+        """Create lookup tables for categorical text fields so they can be
+        turned into numerical features in the observation vector.
+        """
+        df = self._df_master
+        self._address_map = {v: i for i, v in enumerate(df["Incident Address"].fillna("<UNK>").unique())}
+        self._street_map = {v: i for i, v in enumerate(df["Street Name"].fillna("<UNK>").unique())}
+        self._borough_map = {v: i for i, v in enumerate(df["Borough"].fillna("<UNK>").unique())}
+
+        # we will normalise indices by the max+1 when producing a vector
+        self._max_address_idx = max(self._address_map.values()) if self._address_map else 1
+        self._max_street_idx = max(self._street_map.values()) if self._street_map else 1
+        self._max_borough_idx = max(self._borough_map.values()) if self._borough_map else 1
+
+    # ------------------------------------------------------------------
+    # observation / action space helpers
+    # ------------------------------------------------------------------
+
+    def _configure_spaces(self):
+        # determine number of scalar features per report
+        # features: [address_code, street_code, borough_code, council_district,
+        # apartment_only, building_wide, no_heat, no_hot_water,
+        # days_outstanding_norm, created_month_norm]
+        self._features_per_report = 10
+
+        # Observations will be a Dict so we can carry a reports tensor and a mask
+        reports_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(total_state_size,),
-            dtype=np.float32
+            shape=(self.max_active_reports, self._features_per_report),
+            dtype=np.float32,
         )
-        
-        # ====================
-        # ACTION SPACE CONFIGURATION
-        # ====================
-        # Each inspector can perform up to 4 inspections per timestep
-        # For each inspection, they choose which violation report to inspect:
-        # - 0 = no action (skip this inspection slot)
-        # - 1 to num_reports = report index to inspect
-        #
-        # Case outcomes are stochastically determined:
-        # - P(issue_warning) = 0.5
-        # - P(close_as_duplicate) = 0.1  
-        # - P(close_as_resolved) = 0.1
-        # - P(remaining_open) = 0.3
-        #
-        # Action space: MultiDiscrete with 4 slots per inspector
-        # Total length: num_inspectors * 4
+        mask_space = spaces.Box(low=0.0, high=1.0, shape=(self.max_active_reports,), dtype=np.float32)
+        inspectors_space = spaces.Box(low=0.0, high=1.0, shape=(self.num_inspectors,), dtype=np.float32)
+        timestep_space = spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+
+        self.observation_space = spaces.Dict({
+            "reports": reports_space,
+            "mask": mask_space,
+            "inspectors": inspectors_space,
+            "timestep": timestep_space,
+        })
+
+        # Action space: indices into the active pool slots (1-based), 0 = skip
         self.action_space = spaces.MultiDiscrete(
-            [num_reports + 1] * (num_inspectors * 4)  # 4 inspections per inspector
+            [self.max_active_reports + 1] * (self.num_inspectors * self.inspection_rate)
         )
-        
-        # ====================
-        # Environment State Initialization
-        # ====================
-        self.violations: List[ViolationReport] = []
-        self.inspectors: List[Inspector] = []
-        self.current_step = 0
-        self.episode_violations_fixed = 0
-        
-        self._initialize_violations()
-        self._initialize_inspectors()
-    
-    def _initialize_violations(self):
-        """Initialize violation reports from data or synthetic generation."""
-        self.violations = []
-        
-        if self.violation_data_path:
-            self._load_violations_from_csv(self.violation_data_path)
-        else:
-            self._generate_synthetic_violations()
-    
-    def _load_violations_from_csv(self, csv_path: str):
-        """
-        Load violation reports from 311 CSV data.
-        
-        Expected CSV columns:
-        - Unique ID (or index)
-        - Location (address)
-        - Complaint Type (violation type)
-        - Complaint Date
-        - Status (to help identify fixed violations)
-        """
-        try:
-            import pandas as pd
-            df = pd.read_csv(csv_path)
-            
-            # Filter to housing-related complaints if possible
-            # Customize these filters based on your actual data structure
-            housing_keywords = ['housing', 'heat', 'water', 'plumbing', 'electric', 'paint']
-            # df = df[df['Complaint Type'].str.lower().str.contains('|'.join(housing_keywords))]
-            
-            for idx, row in df.iloc[:self.num_reports].iterrows():
-                violation = ViolationReport(
-                    report_id=idx,
-                    location=str(row.get('Location', 'UNKNOWN')),
-                    violation_type=str(row.get('Complaint Type', 'UNKNOWN')),
-                    date_reported=str(row.get('Created Date', 'UNKNOWN')),
-                    days_outstanding=max(0, np.random.randint(0, 365)),
-                    priority_score=0.5  # TOOD - Will be calculated
-                )
-                violation.priority_score = self._calculate_priority(violation)
-                self.violations.append(violation)
-            
-            print(f"Loaded {len(self.violations)} violation reports from {csv_path}")
-        
-        except FileNotFoundError:
-            print(f"CSV file not found at {csv_path}. Using synthetic data instead.")
-            self._generate_synthetic_violations()
-        except ImportError:
-            print("pandas not installed. Using synthetic data instead.")
-            self._generate_synthetic_violations()
-    
-    def _generate_synthetic_violations(self):
-        """Generate synthetic violation reports for testing."""
-        violation_types = [
-            'Heat/Hot Water', 'Plumbing', 'Paint/Wall Condition', 
-            'Electric', 'Water Leak', 'Mold', 'Rodent', 
-            'Ceiling', 'Floor', 'Window/Door'
-        ]
-        
-        for i in range(self.num_reports):
-            violation = ViolationReport(
-                report_id=i,
-                location=f"Address_{np.random.randint(1000, 99999)}",
-                violation_type=np.random.choice(violation_types),
-                date_reported=f"2025-{np.random.randint(1,12):02d}-{np.random.randint(1,28):02d}",
-                days_outstanding=np.random.randint(1, 365),
-                priority_score=0.5
-            )
-            violation.priority_score = self._calculate_priority(violation)
-            self.violations.append(violation)
-    
-    def _calculate_priority(self, violation: ViolationReport) -> float:
-        """
-        Calculate priority score for a violation.
-        
-        Priority factors:
-        - Severity (higher = higher priority)
-        - Days outstanding (longer = higher priority)
-        
-        Customize this based on your specific requirements.
-        """
-        severity_weight = 0.6
-        age_weight = 0.4
-        
-        # Normalize days_outstanding to 0-1
-        max_days = 365
-        age_score = min(violation.days_outstanding / max_days, 1.0)
-        
-        priority = (severity_weight * violation.severity) + (age_weight * age_score)
-        return min(priority, 1.0)
-    
-    def _initialize_inspectors(self):
-        """Initialize inspector availability."""
-        self.inspectors = [
-            Inspector(inspector_id=i)
-            for i in range(self.num_inspectors)
-        ]
-    
+
+    # ------------------------------------------------------------------
+    # environment life‑cycle methods
+    # ------------------------------------------------------------------
+
     def reset(self) -> np.ndarray:
+        """Start a new episode by sampling ``num_reports`` observations from the
+        dataset and resetting all bookkeeping state.
         """
-        Reset the environment to initial state.
-        
-        Returns:
-            Initial observation (state)
-        """
+        # initialise chronological pointers and state
         self.current_step = 0
         self.episode_violations_fixed = 0
-        
-        # Reset violations
-        for violation in self.violations:
-            violation.fixed = False
-            violation.resolved = False
-            violation.duplicate = False
-            violation.status = "OPEN"
-            violation.inspection_count = 0
-        
-        # Reset inspectors
-        self._initialize_inspectors()
-        
+        self.inspectors_available = [True] * self.num_inspectors
+
+        # chronological pointers
+        if len(self._df_master) == 0:
+            raise RuntimeError("No data available in _df_master to run environment")
+
+        self._next_idx = 0
+        first_date = self._df_master.loc[0, "Created Date"].date()
+        self.current_date = first_date
+        self.end_date = first_date + datetime.timedelta(days=self.time_steps - 1)
+
+        # active pool of ViolationReport objects (chronological admission)
+        self.violations = []
+
+        # admit cases for the first date so the initial observation includes them
+        self._admit_reports_for_date(self.current_date)
+
         return self._get_observation()
-    
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
-        """
-        Execute one step of the environment.
-        
-        Args:
-            action: Array of length (num_inspectors * 4) representing up to 4 
-                    inspection assignments per inspector.
-                    Each element in [0, num_reports]:
-                    0 = no action (skip this inspection slot)
-                    1 to num_reports = report index to inspect
-        
-        Returns:
-            observation: Updated state
-            reward: Reward for this step
-            done: Whether episode is finished
-            info: Additional information
-        """
-        self.current_step += 1
-        
-        # ====================
-        # PROCESS ACTIONS
-        # ====================
-        # Track inspection outcomes
-        violations_warned = 0
-        violations_duplicate = 0
-        violations_resolved = 0
-        violations_inspected = []
-        
-        # Process each inspector's actions (up to 4 inspections per inspector)
-        inspections_per_inspector = 4
-        for inspector_id in range(self.num_inspectors):
-            inspection_count = 0
-            
-            # Process each of the 4 inspection slots for this inspector
-            for slot in range(inspections_per_inspector):
-                action_idx_pos = inspector_id * inspections_per_inspector + slot
-                action_idx = int(action[action_idx_pos])
-                
-                # Validate action
-                if action_idx == 0 or action_idx > len(self.violations):
-                    # No action or invalid action
+
+    def step(self, action: np.ndarray):
+        """Apply the inspectors' choices for this day and return the new state,
+        reward, done flag and info dict."""
+        # Process actions for the current day
+        violations_inspected = set()
+        inspection_details = []  # record per-report features/outcomes
+        reward = 0.0
+
+        for insp_id in range(self.num_inspectors):
+            for slot in range(self.inspection_rate):
+                pos = insp_id * self.inspection_rate + slot
+                choice = int(action[pos])
+                # 0 = skip, otherwise 1-based index into active slots
+                if choice == 0:
                     continue
-                
-                # Check if inspector has already done 4 inspections
-                if inspection_count >= inspections_per_inspector:
-                    break
-                
-                violation_idx = action_idx - 1
-                violation = self.violations[violation_idx]
-                
-                # Skip if already resolved
+                if choice > len(self.violations):
+                    # chosen an inactive/padded slot
+                    continue
+
+                vidx = choice - 1
+                if vidx < 0 or vidx >= len(self.violations):
+                    continue
+
+                violations_inspected.add(vidx)
+                violation = self.violations[vidx]
                 if violation.resolved:
                     continue
-                
-                # Record inspection
-                inspection_count += 1
-                violations_inspected.append(violation_idx)
-                violation.inspection_count += 1
-                
-                # Determine case outcome stochastically
-                outcome_roll = np.random.random()
-                cumulative_prob = 0.0
-                
-                if outcome_roll < self.inspection_outcome_probs['issue_warning']:
-                    # Issue warning (50%)
-                    violation.status = "WARNING_ISSUED"
-                    violations_warned += 1
-                elif outcome_roll < (self.inspection_outcome_probs['issue_warning'] + 
-                                    self.inspection_outcome_probs['close_duplicate']):
-                    # Close as duplicate (10%)
-                    violation.status = "DUPLICATE"
-                    violation.resolved = True
-                    violation.duplicate = True
-                    violations_duplicate += 1
-                elif outcome_roll < (self.inspection_outcome_probs['issue_warning'] + 
-                                    self.inspection_outcome_probs['close_duplicate'] +
-                                    self.inspection_outcome_probs['close_resolved']):
-                    # Close as resolved (10%)
-                    violation.status = "RESOLVED"
-                    violation.resolved = True
-                    violations_resolved += 1
+                # record pre-inspection state
+                inspection_details.append({
+                    'report_idx': vidx,
+                    'days_outstanding_before': violation.days_outstanding,
+                    'address': violation.address,
+                    'borough': violation.borough,
+                })
+
+                # sample outcome
+                roll = np.random.random()
+                cum = 0.0
+                for res, prob in self.outcome_probs.items():
+                    cum += prob
+                    if roll < cum:
+                        violation.outcome = res
+                        break
+                violation.resolved = violation.outcome != Resolution.OPEN
+                # append outcome to the inspection record
+                inspection_details[-1]['outcome'] = violation.outcome.name
+
+                # accumulate reward for this individual inspection
+                if violation.outcome == Resolution.VIOLATION:
+                    reward += 20.0
                     self.episode_violations_fixed += 1
-                else:
-                    # Remains open (30%)
-                    violation.status = "OPEN"
-        
-        # ====================
-        # CALCULATE REWARD
-        # ====================
-        reward = self._calculate_reward(
-            violations_resolved,
-            violations_duplicate,
-            violations_warned,
-            len(set(violations_inspected))
-        )
-        
-        # ====================
-        # CHECK TERMINATION
-        # ====================
-        done = self.current_step >= self.time_steps
-        
-        # ====================
-        # GET INFO
-        # ====================
+                elif violation.outcome == Resolution.DUPLICATE:
+                    reward += 3.0
+                elif violation.outcome in (Resolution.NO_ACCESS, Resolution.CORRECTED, Resolution.NO_VIOLATION):
+                    reward += 1.0
+
+        # step penalty for open reports (encourage throughput)
+        open_count = sum(1 for v in self.violations if not v.resolved)
+        reward += -0.1 * open_count
+
+        # age unresolved reports by 1 day
+        for v in self.violations:
+            if not v.resolved:
+                v.days_outstanding += 1.0
+
+        # advance the simulation date and admit new reports for the next day
+        self.current_date = self.current_date + datetime.timedelta(days=1)
+        self._admit_reports_for_date(self.current_date)
+
+        self.current_step += 1
+
+        done = (self.current_step >= self.time_steps) or (self.current_date > self.end_date)
+
+        obs = self._get_observation()
         info = {
-            'violations_resolved': violations_resolved,
-            'violations_marked_duplicate': violations_duplicate,
-            'violations_warned': violations_warned,
-            'total_inspections': len(violations_inspected),
-            'unique_violations_inspected': len(set(violations_inspected)),
-            'timestep': self.current_step,
-            'total_resolved_to_date': self.episode_violations_fixed
+            "open_reports": open_count,
+            "inspections_this_step": len(violations_inspected),
+            "total_resolved": self.episode_violations_fixed,
+            "current_date": str(self.current_date),
+            "inspection_details": inspection_details,
         }
-        
-        observation = self._get_observation()
-        
-        return observation, reward, done, info
-    
-    def _calculate_reward(self, resolved: int, duplicate: int, warned: int, total_inspected: int) -> float:
+        return obs, reward, done, info
+
+    def _make_violation(self, idx: int, row: pd.Series) -> ViolationReport:
+        return ViolationReport(
+            report_id=int(idx),
+            address=row.get("Incident Address", ""),
+            street_name=row.get("Street Name", ""),
+            borough=row.get("Borough", ""),
+            council_district=float(row.get("Council District", 0)),
+            apartment_only=int(row.get("Apartment_Only", 0)),
+            building_wide=int(row.get("Entire_Building", 0)),
+            no_heat=int(row.get("No_Heat", 0)),
+            no_hot_water=int(row.get("No_Hot_Water", 0)),
+            created_date=pd.to_datetime(row["Created Date"]),
+            days_outstanding=float(row.get("days_outstanding", 0.0)),
+            no_access=int(row.get("No_Access", 0)),
+            duplicate=int(row.get("Duplicate", 0)),
+            corrected=int(row.get("Corrected", 0)),
+            no_violation_issued=int(row.get("No_Violation_Issued", 0)),
+            violation_issued=int(row.get("Violation_Issued", 0)),
+        )
+
+    def _admit_reports_for_date(self, date: datetime.date):
+        """Append reports whose Created Date == date to the active pool.
+        Keeps the pool size bounded by trimming oldest unresolved reports if
+        necessary to respect `self.max_active_reports`.
         """
-        Calculate reward for this step.
-        
-        Reward components:
-        - Resolved violations: +20 per violation
-        - Duplicate violations: +10 per violation
-        - Warnings issued: +2 per warning
-        - Penalty for uninspected open violations
-        
-        Customize this based on your objectives.
-        """
-        # Reward for fixing violations
-        resolve_reward = resolved * 20.0
-        duplicate_reward = duplicate * 10.0
-        warning_reward = warned * 2.0
-        
-        # Penalty for violations still open
-        open_violations = sum(1 for v in self.violations if v.status == "OPEN")
-        open_penalty = open_violations * -0.5
-        
-        return resolve_reward + duplicate_reward + warning_reward + open_penalty
-    
+        df = self._df_master
+        n = len(df)
+        added = 0
+        while self._next_idx < n and df.loc[self._next_idx, "Created Date"].date() == date:
+            row = df.loc[self._next_idx]
+            v = self._make_violation(int(self._next_idx), row)
+            self.violations.append(v)
+            self._next_idx += 1
+            added += 1
+
+        # enforce max active pool size by dropping oldest unresolved reports
+        if len(self.violations) > self.max_active_reports:
+            # keep the most recent `max_active_reports` items
+            self.violations = self.violations[-self.max_active_reports :]
+
+        return added
+
+    def _encode_violation(self, v: ViolationReport) -> List[float]:
+        """Turn a single report into a list of normalized floats for the
+        observation vector."""
+        addr_code = self._address_map.get(v.address, 0) / self._max_address_idx
+        street_code = self._street_map.get(v.street_name, 0) / self._max_street_idx
+        borough_code = self._borough_map.get(v.borough, 0) / self._max_borough_idx
+        cd_norm = min(v.council_district / 51.0, 1.0)
+        days_norm = min(v.days_outstanding / 365.0, 1.0)
+        created_month = v.created_date.month / 12.0 if pd.notna(v.created_date) else 0.0
+
+        return [
+            addr_code,
+            street_code,
+            borough_code,
+            cd_norm,
+            float(v.apartment_only),
+            float(v.building_wide),
+            float(v.no_heat),
+            float(v.no_hot_water),
+            days_norm,
+            created_month,
+        ]
+
     def _get_observation(self) -> np.ndarray:
+        """Return a dictionary observation with:
+        - reports: tensor shaped (max_active_reports, features_per_report)
+        - mask: binary vector indicating which slots are active
+        - inspectors: availability vector
+        - timestep: normalized progress through episode
         """
-        Generate the current observation (state) vector.
-        
-        State encoding:
-        - For each violation: [violation_type_encoded, severity, days_outstanding, priority_score]
-        - For each inspector: [available, utilization]
-        - Current timestep (normalized)
-        
-        Returns:
-            Normalized state vector as float32 array
-        """
-        state = []
-        
-        # Add violation features
-        for violation in self.violations:
-            # Encode violation type (0-9 for 10 types, normalized to 0-1)
-            violation_types = [
-                'Heat/Hot Water', 'Plumbing', 'Paint/Wall Condition', 
-                'Electric', 'Water Leak', 'Mold', 'Rodent', 
-                'Ceiling', 'Floor', 'Window/Door'
-            ]
-            
-            try:
-                type_idx = violation_types.index(violation.violation_type)
-            except ValueError:
-                type_idx = 0
-            
-            type_encoded = type_idx / 10.0  # Normalize to 0-1
-            
-            state.extend([
-                type_encoded,
-                violation.severity,
-                min(violation.days_outstanding / 365.0, 1.0),  # Normalize to 0-1
-                violation.priority_score
-            ])
-        
-        # Add inspector features
-        for inspector in self.inspectors:
-            state.extend([
-                float(inspector.available),
-                inspector.utilization
-            ])
-        
-        # Add timestep (normalized)
-        state.append(self.current_step / self.time_steps)
-        
-        return np.array(state, dtype=np.float32)
-    
-    def render(self, mode: str = 'human'):
-        """
-        Render the environment state.
-        
-        Args:
-            mode: 'human' for console output
-        """
-        if mode == 'human':
-            print(f"\n--- Step {self.current_step}/{self.time_steps} ---")
-            print(f"Violations Fixed This Episode: {self.episode_violations_fixed}")
-            print(f"Active Inspectors: {sum(1 for i in self.inspectors if i.available)}")
-            
-            # Show top 5 violations by priority
-            sorted_violations = sorted(
-                self.violations, 
-                key=lambda v: v.priority_score, 
-                reverse=True
-            )
-            
-            print("\nTop 5 Priority Violations:")
-            for v in sorted_violations[:5]:
-                status = "FIXED" if v.fixed else "OPEN"
-                print(
-                    f"  [{status}] {v.violation_type} | Priority: {v.priority_score:.2f} | "
-                    f"Days Outstanding: {v.days_outstanding}"
-                )
-    
+        # prepare reports tensor and mask
+        reports = np.zeros((self.max_active_reports, self._features_per_report), dtype=np.float32)
+        mask = np.zeros((self.max_active_reports,), dtype=np.float32)
+
+        for i, v in enumerate(self.violations[: self.max_active_reports]):
+            reports[i, :] = np.array(self._encode_violation(v), dtype=np.float32)
+            mask[i] = 1.0
+
+        inspectors = np.array([1.0 if a else 0.0 for a in self.inspectors_available], dtype=np.float32)
+        timestep = np.array([float(self.current_step) / max(1, self.time_steps)], dtype=np.float32)
+
+        return {"reports": reports, "mask": mask, "inspectors": inspectors, "timestep": timestep}
+
+    def render(self, mode: str = "human"):
+        if mode == "human":
+            print(f"Step {self.current_step}/{self.time_steps}, open reports = {sum(1 for v in self.violations if not v.resolved)}")
+
     def close(self):
-        """Clean up environment resources."""
         pass
 
 
-# ====================
-# EXAMPLE USAGE
-# ====================
+# --------------------------------------------------
+# simple usage example
+# --------------------------------------------------
 if __name__ == "__main__":
-    # Create environment with synthetic data
-    env = HousingViolationEnv(
-        num_inspectors=100,
-        num_reports=50,
-        time_steps=100
-    )
-    
-    # Or load from 311 CSV:
-    # env = HousingViolationEnv(
-    #     num_inspectors=10,
-    #     num_reports=100,
-    #     time_steps=365,
-    #     violation_data_path="data/311_Service_Requests_from_2020_to_Present_20260224.csv"
-    # )
-    
-    # Example episode
+    # example run: one year of data with a smaller active pool for testing
+    env = HousingEnv(num_inspectors=10, num_reports=50, inspection_rate=4, years=1, max_active_reports=200)
     obs = env.reset()
-    print(f"Initial observation shape: {obs.shape}")
-    
-    for step in range(5):
-        # Random action: allocate each inspector randomly
+    print("initial observation keys:", list(obs.keys()))
+    print("reports shape:", obs["reports"].shape)
+    for t in range(3):
         action = env.action_space.sample()
         obs, reward, done, info = env.step(action)
-        
-        print(f"\nStep {step + 1}")
-        print(f"  Action: {action}")
-        print(f"  Reward: {reward:.2f}")
-        print(f"  Info: {info}")
-        
+        print(t, reward, info)
         env.render()
-        
         if done:
             break
-    
-    env.close()
