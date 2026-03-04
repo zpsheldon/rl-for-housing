@@ -94,6 +94,7 @@ class HousingEnv(gym.Env):
         data_path: Optional[str] = "data/311_preproc.csv",
            max_active_reports: int = 300,
            hierarchical: bool = True,
+           start_date_str: Optional[str] = None,
     ):
         super().__init__()
 
@@ -107,6 +108,7 @@ class HousingEnv(gym.Env):
         self.data_path = data_path
         self.max_active_reports = max_active_reports
         self.hierarchical = hierarchical
+        self.start_date_str = start_date_str
 
         # internal state
         self.current_step = 0
@@ -205,6 +207,50 @@ class HousingEnv(gym.Env):
         self._max_street_idx = max(self._street_map.values()) if self._street_map else 1
         self._max_borough_idx = max(self._borough_map.values()) if self._borough_map else 1
 
+    def _get_outcome_probs(self, violation: ViolationReport) -> Dict[Resolution, float]:
+        """Calculate outcome probabilities based on report features.
+        
+        Implements Options 1 & 2:
+        - Option 1: Building-wide reports have higher violation probability
+        - Option 2: No heat/hot water complaints have higher violation probability
+        
+        Returns a normalized probability distribution that sums to 1.0
+        """
+        # Base probabilities for all outcomes (excluding VIOLATION which is calculated)
+        base_probs = {
+            Resolution.NO_ACCESS: 0.14,
+            Resolution.DUPLICATE: 0.33,
+            Resolution.CORRECTED: 0.33,
+            Resolution.NO_VIOLATION: 0.10,
+        }
+        
+        violation_prob = 0.10  # Base violation probability
+        
+        # Option 1: Building-wide reports are more serious
+        if violation.building_wide:
+            violation_prob += 0.15
+            base_probs[Resolution.NO_VIOLATION] -= 0.08  # Less likely to be harmless
+            base_probs[Resolution.NO_ACCESS] -= 0.07     # Better access to shared building areas
+        
+        # Option 2: No heat/water are urgent health hazards
+        if violation.no_heat or violation.no_hot_water:
+            violation_prob += 0.08
+            base_probs[Resolution.NO_VIOLATION] -= 0.05  # Health hazard, not innocent
+            base_probs[Resolution.NO_ACCESS] -= 0.03
+        
+        # Ensure probabilities don't go negative
+        for key in base_probs:
+            base_probs[key] = max(base_probs[key], 0.01)
+        
+        # Add violation probability
+        base_probs[Resolution.VIOLATION] = violation_prob
+        
+        # Normalize to ensure sum = 1.0
+        total = sum(base_probs.values())
+        normalized_probs = {k: v / total for k, v in base_probs.items()}
+        
+        return normalized_probs
+
     # ------------------------------------------------------------------
     # observation / action space helpers
     # ------------------------------------------------------------------
@@ -265,8 +311,19 @@ class HousingEnv(gym.Env):
         if len(self._df_master) == 0:
             raise RuntimeError("No data available in _df_master to run environment")
 
-        self._next_idx = 0
-        first_date = self._df_master.loc[0, "Created Date"].date()
+        # Determine starting index based on start_date_str
+        if self.start_date_str:
+            start_date = pd.to_datetime(self.start_date_str).date()
+            # Find first index where Created Date >= start_date
+            matching_idx = self._df_master[self._df_master['Created Date'] >= pd.to_datetime(self.start_date_str)]
+            if len(matching_idx) == 0:
+                raise ValueError(f"No data found on or after {self.start_date_str}")
+            self._next_idx = matching_idx.index[0]
+            first_date = start_date
+        else:
+            self._next_idx = 0
+            first_date = self._df_master.loc[0, "Created Date"].date()
+        
         self.current_date = first_date
         self.end_date = first_date + datetime.timedelta(days=self.time_steps - 1)
 
@@ -315,10 +372,11 @@ class HousingEnv(gym.Env):
                         'borough': violation.borough,
                     })
 
-                    # sample outcome
+                    # sample outcome using feature-based probabilities
+                    outcome_probs = self._get_outcome_probs(violation)
                     roll = np.random.random()
                     cum = 0.0
-                    for res, prob in self.outcome_probs.items():
+                    for res, prob in outcome_probs.items():
                         cum += prob
                         if roll < cum:
                             violation.outcome = res
@@ -364,10 +422,11 @@ class HousingEnv(gym.Env):
                         'borough': violation.borough,
                     })
 
-                    # sample outcome
+                    # sample outcome using feature-based probabilities
+                    outcome_probs = self._get_outcome_probs(violation)
                     roll = np.random.random()
                     cum = 0.0
-                    for res, prob in self.outcome_probs.items():
+                    for res, prob in outcome_probs.items():
                         cum += prob
                         if roll < cum:
                             violation.outcome = res
@@ -378,16 +437,15 @@ class HousingEnv(gym.Env):
 
                     # accumulate reward for this individual inspection
                     if violation.outcome == Resolution.VIOLATION:
-                        reward += 20.0
+                        reward += 50.0
                         self.episode_violations_fixed += 1
                     elif violation.outcome == Resolution.DUPLICATE:
-                        reward += 3.0
+                        reward += 20.0
                     elif violation.outcome in (Resolution.NO_ACCESS, Resolution.CORRECTED, Resolution.NO_VIOLATION):
-                        reward += 1.0
+                        reward += 10.0
 
-        # step penalty for open reports (encourage throughput)
+        # count open reports for metrics
         open_count = sum(1 for v in self.violations if not v.resolved)
-        reward += -0.1 * open_count
 
         # age unresolved reports by 1 day
         for v in self.violations:
