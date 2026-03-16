@@ -28,7 +28,7 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import matplotlib.pyplot as plt
 
-from housing_env import HousingEnv
+from housing_env import HousingEnv, RewardWeights
 
 
 # ── Observation utilities ──────────────────────────────────────────────────────
@@ -590,6 +590,7 @@ def train_and_evaluate(
     save_path: str | None = "models/reinforce_baseline.pt",
     plot: bool = True,
     verbose: bool = True,
+    reward_weights: RewardWeights | None = None,
 ) -> dict:
     """Train REINFORCE with baseline on HousingEnv, then evaluate vs. random.
 
@@ -659,6 +660,7 @@ def train_and_evaluate(
         hierarchical=True,
         data_path=data_path,
         start_date_str=train_start_date,
+        reward_weights=reward_weights,
     )
     obs_dim = obs_dim_for(probe)
     probe.close()
@@ -695,6 +697,7 @@ def train_and_evaluate(
             hierarchical=True,
             data_path=data_path,
             start_date_str=train_start_date,
+            reward_weights=reward_weights,
         )
         obs, _ = env.reset(seed=seed + ep)
         done = False
@@ -754,6 +757,7 @@ def train_and_evaluate(
         num_inspectors=num_inspectors, inspection_rate=inspection_rate,
         years=test_years, max_active_reports=max_active_reports,
         hierarchical=True, data_path=data_path, start_date_str=test_start_date,
+        reward_weights=reward_weights,
     )
     reinforce_eval = evaluate_agent(agent, env_reinforce, eval_max_steps, verbose=verbose)
     env_reinforce.close()
@@ -764,6 +768,7 @@ def train_and_evaluate(
         num_inspectors=num_inspectors, inspection_rate=inspection_rate,
         years=test_years, max_active_reports=max_active_reports,
         hierarchical=True, data_path=data_path, start_date_str=test_start_date,
+        reward_weights=reward_weights,
     )
     random_eval = evaluate_random(env_random, eval_max_steps, verbose=verbose)
     env_random.close()

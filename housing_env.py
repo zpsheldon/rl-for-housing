@@ -46,6 +46,44 @@ class Resolution(Enum):
 
 
 @dataclass
+class RewardWeights:
+    """Controls the relative importance of each reward component.
+
+    The base reward for an inspection is decomposed as:
+        accuracy_bonus  = _ACCURACY_BONUS  if outcome == VIOLATION else 0
+        throughput_base = _THROUGHPUT_REWARD[outcome]
+        fairness_bonus  = (expected_borough_share - actual_borough_share) * _FAIRNESS_SCALE
+
+        step_reward = w_accuracy * accuracy_bonus
+                    + w_throughput * throughput_base
+                    + w_fairness * fairness_bonus
+
+        episode_penalty = -open_penalty * open_report_count  (added once per timestep)
+
+    Default values reproduce the original hardcoded reward structure:
+        VIOLATION    -> 40 * 1.0 + 10 * 1.0 = 50
+        DUPLICATE    ->  0 * 1.0 + 20 * 1.0 = 20
+        others       ->  0 * 1.0 + 10 * 1.0 = 10
+    """
+    w_accuracy: float = 1.0   # weight on the violation-detection bonus (40 pts base)
+    w_throughput: float = 1.0 # weight on the report-closure reward (10–20 pts base)
+    w_fairness: float = 0.0   # weight on the borough equity bonus (±10 pts base)
+    open_penalty: float = 0.0 # per-open-report penalty applied once per timestep
+
+
+# Base reward constants (scaled by RewardWeights at runtime)
+_ACCURACY_BONUS = 40.0          # extra reward exclusively for finding a real violation
+_THROUGHPUT_REWARD: Dict[Resolution, float] = {
+    Resolution.VIOLATION:    10.0,
+    Resolution.DUPLICATE:    20.0,
+    Resolution.NO_ACCESS:    10.0,
+    Resolution.CORRECTED:    10.0,
+    Resolution.NO_VIOLATION: 10.0,
+}
+_FAIRNESS_SCALE = 10.0          # multiplier for (expected_share - actual_share)
+
+
+@dataclass
 class ViolationReport:
     """Represents a single 311 housing report extracted from the preprocessed
     file.  All of the attributes correspond directly to columns in
@@ -95,6 +133,7 @@ class HousingEnv(gym.Env):
            max_active_reports: int = 300,
            hierarchical: bool = True,
            start_date_str: Optional[str] = None,
+           reward_weights: Optional[RewardWeights] = None,
     ):
         super().__init__()
 
@@ -109,12 +148,16 @@ class HousingEnv(gym.Env):
         self.max_active_reports = max_active_reports
         self.hierarchical = hierarchical
         self.start_date_str = start_date_str
+        self.reward_weights = reward_weights if reward_weights is not None else RewardWeights()
 
         # internal state
         self.current_step = 0
         self.episode_violations_fixed = 0
         self.violations: List[ViolationReport] = []
         self.inspectors_available: List[bool] = []
+        # borough tracking for fairness reward
+        self._borough_inspections: Dict[str, int] = {}
+        self._borough_report_counts: Dict[str, int] = {}
 
         # load and prepare the dataset immediately so we can compute encodings
         self._load_and_prepare_data()
@@ -291,6 +334,72 @@ class HousingEnv(gym.Env):
             )
 
     # ------------------------------------------------------------------
+    # reward helpers
+    # ------------------------------------------------------------------
+
+    def _update_borough_report_counts(self) -> None:
+        """Recount open (unresolved) reports per borough from the active pool."""
+        counts: Dict[str, int] = {}
+        for v in self.violations:
+            if not v.resolved:
+                counts[v.borough] = counts.get(v.borough, 0) + 1
+        self._borough_report_counts = counts
+
+    def _compute_fairness_bonus(self, borough: str) -> float:
+        """Return a fairness bonus for inspecting `borough`.
+
+        Positive when the borough is under-inspected relative to its share of
+        open reports; negative when over-inspected.  Bounded to ±_FAIRNESS_SCALE.
+        """
+        total_reports = sum(self._borough_report_counts.values())
+        if total_reports == 0:
+            return 0.0
+        expected_share = self._borough_report_counts.get(borough, 0) / total_reports
+
+        total_insp = sum(self._borough_inspections.values())
+        if total_insp == 0:
+            actual_share = 0.0
+        else:
+            actual_share = self._borough_inspections.get(borough, 0) / total_insp
+
+        return (expected_share - actual_share) * _FAIRNESS_SCALE
+
+    def _compute_inspection_reward(self, violation: ViolationReport) -> float:
+        """Compute the weighted reward for a single resolved inspection."""
+        w = self.reward_weights
+        outcome = violation.outcome
+
+        accuracy_bonus = _ACCURACY_BONUS if outcome == Resolution.VIOLATION else 0.0
+        throughput_base = _THROUGHPUT_REWARD.get(outcome, 0.0)
+        fairness_bonus = self._compute_fairness_bonus(violation.borough) if w.w_fairness != 0.0 else 0.0
+
+        return (
+            w.w_accuracy  * accuracy_bonus
+            + w.w_throughput * throughput_base
+            + w.w_fairness   * fairness_bonus
+        )
+
+    def borough_equity_score(self) -> float:
+        """Total-variation distance between inspection shares and report shares.
+
+        Returns a value in [0, 1]: 0 = perfectly equitable, 1 = maximally skewed.
+        Useful for offline analysis and logging.
+        """
+        boroughs = set(self._borough_report_counts) | set(self._borough_inspections)
+        if not boroughs:
+            return 0.0
+        total_reports = max(1, sum(self._borough_report_counts.values()))
+        total_insp    = max(1, sum(self._borough_inspections.values()))
+        tv = sum(
+            abs(
+                self._borough_report_counts.get(b, 0) / total_reports
+                - self._borough_inspections.get(b, 0) / total_insp
+            )
+            for b in boroughs
+        )
+        return tv / 2.0  # normalise to [0, 1]
+
+    # ------------------------------------------------------------------
     # environment life‑cycle methods
     # ------------------------------------------------------------------
 
@@ -306,6 +415,8 @@ class HousingEnv(gym.Env):
         self.current_step = 0
         self.episode_violations_fixed = 0
         self.inspectors_available = [True] * self.num_inspectors
+        self._borough_inspections = {}
+        self._borough_report_counts = {}
 
         # chronological pointers
         if len(self._df_master) == 0:
@@ -340,7 +451,9 @@ class HousingEnv(gym.Env):
     def step(self, action: np.ndarray):
         """Apply the inspectors' choices for this day and return the new state,
         reward, done flag and info dict."""
-        # Process actions for the current day
+        # Refresh report-count denominator used by the fairness term
+        self._update_borough_report_counts()
+
         violations_inspected = set()
         inspection_details = []  # record per-report features/outcomes
         reward = 0.0
@@ -351,20 +464,19 @@ class HousingEnv(gym.Env):
             action_val = int(action)
             insp_id = action_val // self.max_active_reports
             report_id = action_val % self.max_active_reports
-            
+
             # Validate inspector and report indices
             if insp_id < 0 or insp_id >= self.num_inspectors:
                 insp_id = 0
             if report_id >= len(self.violations):
                 report_id = len(self.violations) - 1 if len(self.violations) > 0 else -1
-            
+
             # Perform inspection if valid
             if report_id >= 0 and report_id < len(self.violations):
                 vidx = report_id
                 violation = self.violations[vidx]
                 if not violation.resolved:
                     violations_inspected.add(vidx)
-                    # record pre-inspection state
                     inspection_details.append({
                         'report_idx': vidx,
                         'days_outstanding_before': violation.days_outstanding,
@@ -382,17 +494,15 @@ class HousingEnv(gym.Env):
                             violation.outcome = res
                             break
                     violation.resolved = violation.outcome != Resolution.OPEN
-                    # append outcome to the inspection record
                     inspection_details[-1]['outcome'] = violation.outcome.name
 
-                    # accumulate reward for this individual inspection
+                    # compute fairness bonus using pre-inspection shares, then record
+                    reward += self._compute_inspection_reward(violation)
+                    b = violation.borough
+                    self._borough_inspections[b] = self._borough_inspections.get(b, 0) + 1
+
                     if violation.outcome == Resolution.VIOLATION:
-                        reward += 20.0
                         self.episode_violations_fixed += 1
-                    elif violation.outcome == Resolution.DUPLICATE:
-                        reward += 3.0
-                    elif violation.outcome in (Resolution.NO_ACCESS, Resolution.CORRECTED, Resolution.NO_VIOLATION):
-                        reward += 1.0
         else:
             # Original flat action space (multiple actions per step)
             for insp_id in range(self.num_inspectors):
@@ -403,7 +513,6 @@ class HousingEnv(gym.Env):
                     if choice == 0:
                         continue
                     if choice > len(self.violations):
-                        # chosen an inactive/padded slot
                         continue
 
                     vidx = choice - 1
@@ -414,7 +523,6 @@ class HousingEnv(gym.Env):
                     violation = self.violations[vidx]
                     if violation.resolved:
                         continue
-                    # record pre-inspection state
                     inspection_details.append({
                         'report_idx': vidx,
                         'days_outstanding_before': violation.days_outstanding,
@@ -432,20 +540,21 @@ class HousingEnv(gym.Env):
                             violation.outcome = res
                             break
                     violation.resolved = violation.outcome != Resolution.OPEN
-                    # append outcome to the inspection record
                     inspection_details[-1]['outcome'] = violation.outcome.name
 
-                    # accumulate reward for this individual inspection
+                    # compute fairness bonus using pre-inspection shares, then record
+                    reward += self._compute_inspection_reward(violation)
+                    b = violation.borough
+                    self._borough_inspections[b] = self._borough_inspections.get(b, 0) + 1
+
                     if violation.outcome == Resolution.VIOLATION:
-                        reward += 50.0
                         self.episode_violations_fixed += 1
-                    elif violation.outcome == Resolution.DUPLICATE:
-                        reward += 20.0
-                    elif violation.outcome in (Resolution.NO_ACCESS, Resolution.CORRECTED, Resolution.NO_VIOLATION):
-                        reward += 10.0
 
         # count open reports for metrics
         open_count = sum(1 for v in self.violations if not v.resolved)
+
+        # per-timestep open-report penalty (default 0 → no change in behaviour)
+        reward -= self.reward_weights.open_penalty * open_count
 
         # age unresolved reports by 1 day
         for v in self.violations:
@@ -468,6 +577,8 @@ class HousingEnv(gym.Env):
             "total_resolved": self.episode_violations_fixed,
             "current_date": str(self.current_date),
             "inspection_details": inspection_details,
+            "borough_equity_score": self.borough_equity_score(),
+            "borough_inspections": dict(self._borough_inspections),
         }
         return obs, reward, terminated, truncated, info
 
